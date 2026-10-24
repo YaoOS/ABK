@@ -2023,7 +2023,41 @@ jobs:
                 && ! grep -q '^diff --git a/kernel/Kbuild b/kernel/Kbuild' ./10_enable_susfs_for_ksu.patch; then
                 sed -i 's|kernel/Makefile|kernel/Kbuild|g' ./10_enable_susfs_for_ksu.patch
               fi
-              patch -p1 --forward < 10_enable_susfs_for_ksu.patch || true
+              # ABK: hunk #1 of 10_enable_susfs_for_ksu.patch deletes
+              # my_sel_open_handle_status(), which it expects to hold the locked
+              # read of fake_status. Some KernelSU revisions ship the unlocked
+              # one-liner instead, and `patch --fuzz` cannot bridge that (fuzz
+              # only relaxes context lines, never '-' deletions). Restore the
+              # four lines first so the hunk applies at fuzz=0; the patch then
+              # deletes them again in the same run, so they never compile.
+              python3 -I "$GITHUB_WORKSPACE/.github/scripts/normalize-selinux-hide.py" "$(pwd)"
+
+              patch -p1 --forward --fuzz=0 < 10_enable_susfs_for_ksu.patch || true
+
+              # `|| true` above keeps the build alive. Two distinct failure
+              # shapes must both be caught here:
+              #   1. a hunk rejects -> a .rej file appears on disk
+              #   2. the target file or patch never resolves -> patch prints
+              #      "can't find file to patch" and writes NO .rej at all
+              # Case 2 is the dangerous one: a .rej-only guard passes it
+              # silently. So assert on the post-state of the file instead. The
+              # hunk that must land is the one deleting my_sel_open_handle_status.
+              mapfile -t KSU_REJS < <(find "$(pwd)" -type f -name '*.rej')
+              if [ "${#KSU_REJS[@]}" -gt 0 ]; then
+                echo "::error::10_enable_susfs_for_ksu.patch left rejects:"
+                printf '%s\n' "${KSU_REJS[@]}"
+                exit 1
+              fi
+              if grep -qF 'my_sel_open_handle_status' kernel/feature/selinux_hide.c; then
+                echo "::error::10_enable_susfs_for_ksu.patch did not take effect:"
+                echo "::error::  my_sel_open_handle_status still present"
+                exit 1
+              fi
+              if ! grep -qF 'ksu_selinux_hide_handle_second_stage' kernel/feature/selinux_hide.c; then
+                echo "::error::10_enable_susfs_for_ksu.patch did not take effect:"
+                echo "::error::  ksu_selinux_hide_handle_second_stage missing"
+                exit 1
+              fi
 
               cd ..
               ;;
