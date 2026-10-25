@@ -5546,8 +5546,43 @@ jobs:
                   raise SystemExit(f"未找到 {path}，无法补齐 Official SUSFS hook 符号")
 
               text = path.read_text()
+
+              # ABK: only inject a symbol when nothing else in the tree defines
+              # it. KernelSU >= 528bafc5 ships infra/symbol_resolver.c with
+              # ksu_resolve_symbol_for_functable_hook / find_kernel_symbol_exact
+              # / ksu_init_symbol_resolver already implemented; adding a second
+              # copy in lsm_hook.c compiles fine and then fails at link time:
+              #   ld.lld: error: duplicate symbol: ksu_resolve_symbol_for_functable_hook
+              tree_defs = set()
+              resolver_targets = (
+                  "ksu_resolve_symbol_for_functable_hook",
+                  "find_kernel_symbol_exact",
+                  "ksu_init_symbol_resolver",
+              )
+              for source in ksu_dir.rglob("*"):
+                  if source.suffix not in (".c", ".h") or source == path:
+                      continue
+                  try:
+                      body = source.read_text(errors="ignore")
+                  except OSError:
+                      continue
+                  for symbol in resolver_targets:
+                      if symbol in tree_defs:
+                          continue
+                      if re.search(
+                          rf"(?m)^[A-Za-z_][A-Za-z0-9_ \t\*]*\b{re.escape(symbol)}\s*\([^;]*\)\s*\{{",
+                          body,
+                      ):
+                          tree_defs.add(symbol)
+
               additions = []
-              if "abk_ksu_lookup_symbol(" not in text:
+              # The helper is only needed by the injected wrappers below. If the
+              # tree already implements all three, injecting it alone would leave
+              # an unused static function (and -Wunused-function noise).
+              need_wrappers = any(
+                  symbol not in tree_defs for symbol in resolver_targets
+              )
+              if need_wrappers and "abk_ksu_lookup_symbol(" not in text:
                   additions.append(
                       "#include <linux/kallsyms.h>\n"
                       "#include <linux/kernel.h>\n\n"
@@ -5570,11 +5605,14 @@ jobs:
                       "#endif\n"
                       "}\n"
                   )
-              if not re.search(r"(?m)^\s*void\s+\*\s*ksu_resolve_symbol_for_functable_hook\s*\(", text):
+              if "ksu_resolve_symbol_for_functable_hook" not in tree_defs \
+                      and not re.search(r"(?m)^\s*void\s+\*\s*ksu_resolve_symbol_for_functable_hook\s*\(", text):
                   additions.append("void *ksu_resolve_symbol_for_functable_hook(const char *symbol_name)\n{\n    return abk_ksu_lookup_symbol(symbol_name);\n}\n")
-              if not re.search(r"(?m)^\s*unsigned long\s+find_kernel_symbol_exact\s*\(", text):
+              if "find_kernel_symbol_exact" not in tree_defs \
+                      and not re.search(r"(?m)^\s*unsigned long\s+find_kernel_symbol_exact\s*\(", text):
                   additions.append("unsigned long find_kernel_symbol_exact(const char *symbol_name)\n{\n    return (unsigned long)abk_ksu_lookup_symbol(symbol_name);\n}\n")
-              if not re.search(r"(?m)^\s*void\s+ksu_init_symbol_resolver\s*\(", text):
+              if "ksu_init_symbol_resolver" not in tree_defs \
+                      and not re.search(r"(?m)^\s*void\s+ksu_init_symbol_resolver\s*\(", text):
                   additions.append("void ksu_init_symbol_resolver(void)\n{\n}\n")
 
               if not additions:
