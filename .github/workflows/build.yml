@@ -2023,25 +2023,10 @@ jobs:
                 && ! grep -q '^diff --git a/kernel/Kbuild b/kernel/Kbuild' ./10_enable_susfs_for_ksu.patch; then
                 sed -i 's|kernel/Makefile|kernel/Kbuild|g' ./10_enable_susfs_for_ksu.patch
               fi
-              # ABK: hunk #1 of 10_enable_susfs_for_ksu.patch deletes
-              # my_sel_open_handle_status(), which it expects to hold the locked
-              # read of fake_status. Some KernelSU revisions ship the unlocked
-              # one-liner instead, and `patch --fuzz` cannot bridge that (fuzz
-              # only relaxes context lines, never '-' deletions). Restore the
-              # four lines first so the hunk applies at fuzz=0; the patch then
-              # deletes them again in the same run, so they never compile.
               python3 -I "$GITHUB_WORKSPACE/.github/scripts/normalize-selinux-hide.py" "$(pwd)"
 
               patch -p1 --forward --fuzz=0 < 10_enable_susfs_for_ksu.patch || true
 
-              # `|| true` above keeps the build alive. Two distinct failure
-              # shapes must both be caught here:
-              #   1. a hunk rejects -> a .rej file appears on disk
-              #   2. the target file or patch never resolves -> patch prints
-              #      "can't find file to patch" and writes NO .rej at all
-              # Case 2 is the dangerous one: a .rej-only guard passes it
-              # silently. So assert on the post-state of the file instead. The
-              # hunk that must land is the one deleting my_sel_open_handle_status.
               mapfile -t KSU_REJS < <(find "$(pwd)" -type f -name '*.rej')
               if [ "${#KSU_REJS[@]}" -gt 0 ]; then
                 echo "::error::10_enable_susfs_for_ksu.patch left rejects:"
@@ -2049,13 +2034,11 @@ jobs:
                 exit 1
               fi
               if grep -qF 'my_sel_open_handle_status' kernel/feature/selinux_hide.c; then
-                echo "::error::10_enable_susfs_for_ksu.patch did not take effect:"
-                echo "::error::  my_sel_open_handle_status still present"
+                echo "::error::10_enable_susfs_for_ksu.patch did not take effect: my_sel_open_handle_status still present"
                 exit 1
               fi
               if ! grep -qF 'ksu_selinux_hide_handle_second_stage' kernel/feature/selinux_hide.c; then
-                echo "::error::10_enable_susfs_for_ksu.patch did not take effect:"
-                echo "::error::  ksu_selinux_hide_handle_second_stage missing"
+                echo "::error::10_enable_susfs_for_ksu.patch did not take effect: ksu_selinux_hide_handle_second_stage missing"
                 exit 1
               fi
 
@@ -4903,6 +4886,56 @@ jobs:
 
               return changed
 
+          def ensure_official_preinit_close_fd(ksu_dir):
+              """Linux 5.10 has no close_fd(); it landed in 5.11.
+
+              KernelSU's preinit.c calls close_fd(fd). On 5.10 the equivalent
+              is __close_fd(current->files, fd). Add an inline shim after the
+              last #include so the call resolves, and fail loudly if the file
+              cannot be patched rather than discovering it at compile time.
+              """
+              path = ksu_dir / "preinit/preinit.c"
+              if not path.exists():
+                  return False
+
+              text = path.read_text()
+              if "abk_close_fd_compat" in text:
+                  return False
+              if "close_fd(" not in text:
+                  return False
+
+              lines = text.splitlines(keepends=True)
+              last_include = -1
+              for index, line in enumerate(lines):
+                  if line.lstrip().startswith("#include"):
+                      last_include = index
+              if last_include < 0:
+                  raise SystemExit(f"{path}: 找不到 #include，无法插入 close_fd 兼容 shim")
+
+              shim = (
+                  "\n"
+                  "/* ABK: close_fd() only exists since 5.11; 5.10 exposes __close_fd(). */\n"
+                  "#if LINUX_VERSION_CODE < KERNEL_VERSION(5, 11, 0)\n"
+                  "#include <linux/version.h>\n"
+                  "#include <linux/sched.h>\n"
+                  "#include <linux/syscalls.h>\n"
+                  "static inline int abk_close_fd_compat(unsigned int fd)\n"
+                  "{\n"
+                  "    return __close_fd(current->files, fd);\n"
+                  "}\n"
+                  "#define close_fd(fd) abk_close_fd_compat(fd)\n"
+                  "#endif\n"
+              )
+              lines.insert(last_include + 1, shim)
+              result = "".join(lines)
+
+              if "abk_close_fd_compat" not in result:
+                  raise SystemExit(f"{path}: close_fd shim 插入失败")
+
+              path.write_text(result)
+              print(f"已为 {path} 注入 5.10 close_fd 兼容 shim")
+              return True
+
           def ensure_official_sucompat_execveat_compat(ksu_dir):
               changed = False
 
@@ -5227,12 +5260,10 @@ jobs:
               # Keep C escape sequences literal; re.sub() would reinterpret \n in the replacement text.
               text = region_pattern.sub(lambda _match: replacement, text, count=1)
 
-              # ABK: KernelSU >= 528bafc5 (commit #3945) moved get_user_arg_ptr()
-              # into runtime/ksud.h as a static inline, and every translation unit
-              # that includes it now gets the definition. The replacement above
-              # drops the local copy unconditionally; put it back only when the
-              # tree really has no such helper, otherwise the compiler emits
-              # "redefinition of 'get_user_arg_ptr'".
+              # ABK: KernelSU >= 528bafc5 (#3945) moved get_user_arg_ptr() into
+              # runtime/ksud.h as a static inline, so including it already
+              # provides the definition. The replacement above drops the local
+              # copy; put it back only when the tree lacks the helper.
               ksud_h = ksu_dir / "runtime/ksud.h"
               ksud_has_helper = False
               if ksud_h.exists():
@@ -5647,6 +5678,7 @@ jobs:
           changed = ensure_official_boot_event_compat(ksu_dir) or changed
           changed = ensure_official_sulog_argv_compat(ksu_dir) or changed
           changed = ensure_official_app_profile_compat(ksu_dir) or changed
+          changed = ensure_official_preinit_close_fd(ksu_dir) or changed
           changed = ensure_official_sucompat_execveat_compat(ksu_dir) or changed
 
           runtime_c = ksu_dir / "runtime/ksud_integration.c"
