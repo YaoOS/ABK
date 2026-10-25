@@ -1595,8 +1595,11 @@ jobs:
                   print(f"Patched BakaSU selinux_hide compatibility exports: {path}")
 
               final_text = path.read_text()
+              # ABK: fake_state is NOT in the required list. Newer BakaSU drops
+              # the variable entirely ("新版已移除该变量" in fix_sukisu_susfs.py);
+              # the re.sub above only re-exports it when present and never
+              # creates it, so demanding it here fails on trees that removed it.
               required = (
-                  "struct selinux_state fake_state;",
                   "DEFINE_STATIC_KEY_FALSE(fake_status_initialize_key);",
                   "struct page *fake_status = NULL;",
                   "bool ksu_selinux_hide_enabled __read_mostly",
